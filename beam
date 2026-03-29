@@ -52,8 +52,8 @@ if ! command -v jq &>/dev/null; then
 fi
 
 # --- Constants ---
-STATE_DIR="${HOME}/.local/state/beam"
-STATE_FILE="${STATE_DIR}/state.json"
+STATE_DIR="${STATE_DIR:-${HOME}/.local/state/beam}"
+STATE_FILE="${STATE_FILE:-${STATE_DIR}/state.json}"
 
 # --- State initialization ---
 init_state() {
@@ -67,12 +67,110 @@ init_state() {
 
 # --- State read/write helpers ---
 read_state() {
-    cat "$STATE_FILE"
+    local content
+    content=$(cat "$STATE_FILE")
+    # Validate: must be valid JSON with a .spaces object
+    if [[ -z "${content// /}" ]] || ! echo "$content" | jq -e '.spaces' &>/dev/null; then
+        warn "State file corrupted, resetting to defaults." >&2
+        content='{"spaces": {}}'
+        echo "$content" > "$STATE_FILE"
+    fi
+    echo "$content"
 }
 
 write_state() {
     local new_state="$1"
+    if ! echo "$new_state" | jq empty 2>/dev/null; then
+        err "Refusing to write invalid state (would corrupt state file)."
+        return 1
+    fi
     echo "$new_state" > "$STATE_FILE"
+}
+
+# --- Shared helpers ---
+
+# Validate that a space exists in state. Exits 1 if not found.
+require_space() {
+    local state="$1" space="$2"
+    local exists
+    exists=$(echo "$state" | jq -r ".spaces[\"$space\"] // \"null\"")
+    if [[ "$exists" == "null" ]]; then
+        err "Space '${space}' does not exist."
+        exit 1
+    fi
+}
+
+# Validate that a session exists in a space. Exits 1 if not found.
+require_session() {
+    local state="$1" space="$2" session="$3"
+    local session_data
+    session_data=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"] // \"null\"")
+    if [[ "$session_data" == "null" ]]; then
+        err "Session '${session}' does not exist in space '${space}'."
+        exit 1
+    fi
+}
+
+# Read all session fields in one jq call. Returns tab-separated:
+# host status pid local_client_port remote_client_port local_server_port remote_server_port project worktree
+read_session() {
+    local state="$1" space="$2" session="$3"
+    echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"] |
+        [.host, .status, (.pid // \"null\" | tostring), (.local_client_port|tostring), (.remote_client_port|tostring), (.local_server_port|tostring), (.remote_server_port|tostring), .project, .worktree] | @tsv"
+}
+
+# Kill a session's tunnel and mark it dormant in state.
+sleep_session() {
+    local space="$1" session="$2"
+
+    local state
+    state=$(read_state)
+    local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+    IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+
+    if [[ "$s_status" == "live" && "$s_pid" != "null" ]]; then
+        kill_tunnel "$s_pid" "$s_lc" "$s_ls"
+    fi
+
+    state=$(read_state)
+    state=$(echo "$state" | jq ".spaces[\"$space\"].sessions[\"$session\"].status = \"dormant\" | .spaces[\"$space\"].sessions[\"$session\"].pid = null")
+    write_state "$state"
+}
+
+# Check for port conflicts and resolve them. Returns 0 if no conflict or resolved, 1 if user cancelled.
+check_and_resolve_conflicts() {
+    local lc="$1" ls="$2" space="$3" session="$4"
+
+    local conflict
+    conflict=$(find_port_conflicts "$lc" "$ls" "$space" "$session")
+    if [[ -n "$conflict" ]]; then
+        local state
+        state=$(read_state)
+        local conflict_space conflict_session
+        conflict_space=$(echo "$conflict" | cut -d: -f1)
+        conflict_session=$(echo "$conflict" | cut -d: -f2-)
+        resolve_conflict "$state" "$conflict_space" "$conflict_session"
+        return $?
+    fi
+    return 0
+}
+
+# Activate a session tunnel and print the result.
+activate_and_report() {
+    local space="$1" session="$2" host="$3" lc="$4" rc="$5" ls="$6" rs="$7" success_msg="$8"
+
+    echo ""
+    printf "  ${DIM}Connecting...${RESET}"
+    if activate_session "$space" "$session" "$host" "$lc" "$rc" "$ls" "$rs"; then
+        printf "\r\033[K"
+        ok "${BOLD}${session}${RESET} ${success_msg}"
+        print_ports "$host" "$lc" "$rc" "$ls" "$rs"
+    else
+        printf "\r\033[K"
+        err "Failed to start tunnel for ${BOLD}${session}${RESET}."
+        hint "Try: beam ${space} up"
+    fi
+    echo ""
 }
 
 # --- Arrow-key selector ---
@@ -203,21 +301,15 @@ select_session() {
     declare -a candidates
     declare -a display_lines
     while IFS= read -r s; do
+        local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+        IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$s")"
+
         if [[ -n "$filter" ]]; then
-            local s_status
-            s_status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$s\"].status")
             [[ "$s_status" != "$filter" ]] && continue
         fi
         candidates+=("$s")
 
-        local s_status s_host lc rc ls_port rs indicator
-        s_status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$s\"].status")
-        s_host=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$s\"].host")
-        lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$s\"].local_client_port")
-        rc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$s\"].remote_client_port")
-        ls_port=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$s\"].local_server_port")
-        rs=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$s\"].remote_server_port")
-
+        local indicator
         if [[ "$s_status" == "live" ]]; then
             indicator="${GREEN}●${RESET}"
         else
@@ -225,7 +317,7 @@ select_session() {
         fi
 
         display_lines+=("$(printf "%b  %-30s ${DIM}%s${RESET}  ${DIM}%s:%s, %s:%s${RESET}" \
-            "$indicator" "$s" "$s_host" "$lc" "$rc" "$ls_port" "$rs")")
+            "$indicator" "$s" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs")")
     done <<< "$sessions"
 
     if [[ ${#candidates[@]} -eq 0 ]]; then
@@ -262,22 +354,29 @@ start_tunnel() {
     ssh -fN \
         -o ServerAliveInterval=30 \
         -o ServerAliveCountMax=3 \
-        -o ExitOnForwardFailure=yes \
         -L "${local_client}:localhost:${remote_client}" \
         -L "${local_server}:localhost:${remote_server}" \
-        "$host" || ssh_exit=$?
+        "$host" 2>/dev/null || ssh_exit=$?
 
     if [[ "$ssh_exit" -ne 0 ]]; then
         echo ""
         return 1
     fi
 
-    sleep 0.3
+    sleep 0.5
 
     local pid
     pid=$(pgrep -n -f "ssh.*-L ${local_client}:localhost:${remote_client}.*${host}" 2>/dev/null || true)
 
     if [[ -z "$pid" ]]; then
+        echo ""
+        return 1
+    fi
+
+    # Verify our local forwards are actually listening
+    if ! lsof -i ":${local_client}" -sTCP:LISTEN &>/dev/null || \
+       ! lsof -i ":${local_server}" -sTCP:LISTEN &>/dev/null; then
+        kill "$pid" 2>/dev/null || true
         echo ""
         return 1
     fi
@@ -361,16 +460,14 @@ find_port_conflicts() {
                 continue
             fi
 
-            local status lc ls
-            status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].status" 2>/dev/null)
-            if [[ "$status" != "live" ]]; then
+            local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+            IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+
+            if [[ "$s_status" != "live" ]]; then
                 continue
             fi
 
-            lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_client_port" 2>/dev/null)
-            ls=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_server_port" 2>/dev/null)
-
-            if [[ "$lc" == "$target_local_client" || "$ls" == "$target_local_server" || "$lc" == "$target_local_server" || "$ls" == "$target_local_client" ]]; then
+            if [[ "$s_lc" == "$target_local_client" || "$s_ls" == "$target_local_server" || "$s_lc" == "$target_local_server" || "$s_ls" == "$target_local_client" ]]; then
                 echo "${space}:${session}"
                 return
             fi
@@ -385,20 +482,12 @@ resolve_conflict() {
     local conflict_space="$2"
     local conflict_session="$3"
 
-    local cpid c_lc c_ls
-    cpid=$(echo "$state" | jq -r ".spaces[\"$conflict_space\"].sessions[\"$conflict_session\"].pid // \"null\"")
-    c_lc=$(echo "$state" | jq -r ".spaces[\"$conflict_space\"].sessions[\"$conflict_session\"].local_client_port")
-    c_ls=$(echo "$state" | jq -r ".spaces[\"$conflict_space\"].sessions[\"$conflict_session\"].local_server_port")
-
     echo ""
     warn "Port conflict with ${BOLD}${conflict_session}${RESET} ${DIM}(${conflict_space})${RESET}"
     printf "  Sleep it? ${DIM}(y/n)${RESET} "
     read -r answer </dev/tty
     if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
-        kill_tunnel "$cpid" "$c_lc" "$c_ls"
-        state=$(read_state)
-        state=$(echo "$state" | jq ".spaces[\"$conflict_space\"].sessions[\"$conflict_session\"].status = \"dormant\" | .spaces[\"$conflict_space\"].sessions[\"$conflict_session\"].pid = null")
-        write_state "$state"
+        sleep_session "$conflict_space" "$conflict_session"
         printf "  ${DIM}○${RESET} %s slept\n" "$conflict_session"
         return 0
     else
@@ -418,10 +507,14 @@ activate_session() {
     local ls="$6"
     local rs="$7"
 
-    local pid=""
-    pid=$(start_tunnel "$host" "$lc" "$rc" "$ls" "$rs" 2>&1) || true
+    local raw_pid=""
+    raw_pid=$(start_tunnel "$host" "$lc" "$rc" "$ls" "$rs" 2>/dev/null) || true
 
-    if [[ -n "$pid" && "$pid" != "" ]]; then
+    # Sanitize: extract only the numeric PID (strip any SSH warnings that leaked into stdout)
+    local pid=""
+    pid=$(echo "$raw_pid" | grep -E '^[0-9]+$' | tail -1)
+
+    if [[ -n "$pid" ]]; then
         local state
         state=$(read_state)
         state=$(echo "$state" | jq ".spaces[\"$space\"].sessions[\"$session\"].status = \"live\" | .spaces[\"$space\"].sessions[\"$session\"].pid = $pid")
@@ -502,13 +595,7 @@ cmd_space_rm() {
 
     local state
     state=$(read_state)
-
-    local exists
-    exists=$(echo "$state" | jq -r ".spaces[\"$name\"] // \"null\"")
-    if [[ "$exists" == "null" ]]; then
-        err "Space '${name}' does not exist."
-        exit 1
-    fi
+    require_space "$state" "$name"
 
     local session_count
     session_count=$(echo "$state" | jq ".spaces[\"$name\"].sessions | length")
@@ -523,19 +610,16 @@ cmd_space_rm() {
         local sessions
         sessions=$(echo "$state" | jq -r ".spaces[\"$name\"].sessions | keys[]" 2>/dev/null || true)
         for session in $sessions; do
-            local pid s_lc s_ls
-            pid=$(echo "$state" | jq -r ".spaces[\"$name\"].sessions[\"$session\"].pid // \"null\"")
-            s_lc=$(echo "$state" | jq -r ".spaces[\"$name\"].sessions[\"$session\"].local_client_port")
-            s_ls=$(echo "$state" | jq -r ".spaces[\"$name\"].sessions[\"$session\"].local_server_port")
-            local status
-            status=$(echo "$state" | jq -r ".spaces[\"$name\"].sessions[\"$session\"].status")
-            if [[ "$status" == "live" && "$pid" != "null" ]]; then
-                kill_tunnel "$pid" "$s_lc" "$s_ls"
+            local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+            IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$name" "$session")"
+            if [[ "$s_status" == "live" && "$s_pid" != "null" ]]; then
+                kill_tunnel "$s_pid" "$s_lc" "$s_ls"
                 printf "  ${DIM}○${RESET} killed %s\n" "$session"
             fi
         done
     fi
 
+    state=$(read_state)
     state=$(echo "$state" | jq "del(.spaces[\"$name\"])")
     write_state "$state"
     echo ""
@@ -550,13 +634,7 @@ cmd_session_create() {
 
     local state
     state=$(read_state)
-
-    local exists
-    exists=$(echo "$state" | jq -r ".spaces[\"$space\"] // \"null\"")
-    if [[ "$exists" == "null" ]]; then
-        err "Space '${space}' does not exist."
-        exit 1
-    fi
+    require_space "$state" "$space"
 
     echo ""
     printf "  ${BOLD}SSH host${RESET} ${DIM}(e.g. ag@hetzner1)${RESET}: "
@@ -571,7 +649,7 @@ cmd_session_create() {
 
     printf "  ${DIM}Scanning %s...${RESET}" "$host"
     local dirlist
-    dirlist=$(ssh -o ConnectTimeout=10 "$host" 'ls -1d ~/codebases/*/ 2>/dev/null | while read d; do basename "$d"; done | sort')
+    dirlist=$(ssh -o ConnectTimeout=10 -o ClearAllForwardings=yes "$host" 'ls -1d ~/codebases/*/ 2>/dev/null | while read d; do basename "$d"; done | sort' 2>/dev/null)
     printf "\r\033[K"
 
     if [[ -z "$dirlist" ]]; then
@@ -640,7 +718,7 @@ cmd_session_create() {
         grep_cmd="${grep_cmd}echo \"${wt}|\$(grep '^WASP_CLIENT_PORT=' ~/codebases/${wt}/.env 2>/dev/null | cut -d= -f2 || echo none)\";"
     done
     local wt_ports
-    wt_ports=$(ssh -o ConnectTimeout=10 "$host" "$grep_cmd")
+    wt_ports=$(ssh -o ConnectTimeout=10 -o ClearAllForwardings=yes "$host" "$grep_cmd" 2>/dev/null)
 
     echo ""
     label "  Worktrees"
@@ -674,7 +752,7 @@ cmd_session_create() {
     fi
 
     local remote_env
-    remote_env=$(ssh -o ConnectTimeout=10 "$host" "cat ~/codebases/$worktree/.env 2>/dev/null")
+    remote_env=$(ssh -o ConnectTimeout=10 -o ClearAllForwardings=yes "$host" "cat ~/codebases/$worktree/.env 2>/dev/null" 2>/dev/null)
 
     if [[ -z "$remote_env" ]]; then
         err "Could not read ~/codebases/${worktree}/.env on ${host}"
@@ -704,19 +782,24 @@ cmd_session_create() {
     local session_exists
     session_exists=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session_name\"] // \"null\"")
     if [[ "$session_exists" != "null" ]]; then
-        err "Session '${session_name}' already exists in space '${space}'."
-        exit 1
+        echo ""
+        warn "Session '${session_name}' already exists in space '${space}'."
+        printf "  Replace it? ${DIM}(y/n)${RESET} "
+        read -r answer </dev/tty
+        if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
+            sleep_session "$space" "$session_name"
+            state=$(read_state)
+            state=$(echo "$state" | jq "del(.spaces[\"$space\"].sessions[\"$session_name\"])")
+            write_state "$state"
+            printf "  ${DIM}○${RESET} old session removed\n"
+        else
+            hint "Cancelled."
+            exit 0
+        fi
     fi
 
     # Check for port conflicts
-    local conflict
-    conflict=$(find_port_conflicts "$local_client" "$local_server" "$space" "$session_name")
-    if [[ -n "$conflict" ]]; then
-        local conflict_space conflict_session
-        conflict_space=$(echo "$conflict" | cut -d: -f1)
-        conflict_session=$(echo "$conflict" | cut -d: -f2-)
-        resolve_conflict "$state" "$conflict_space" "$conflict_session" || exit 0
-    fi
+    check_and_resolve_conflicts "$local_client" "$local_server" "$space" "$session_name" || exit 0
 
     # Create session in state
     state=$(read_state)
@@ -733,18 +816,7 @@ cmd_session_create() {
     }")
     write_state "$state"
 
-    echo ""
-    printf "  ${DIM}Connecting...${RESET}"
-    if activate_session "$space" "$session_name" "$host" "$local_client" "$client_port" "$local_server" "$server_port"; then
-        printf "\r\033[K"
-        ok "${BOLD}${session_name}${RESET} created and live"
-        print_ports "$host" "$local_client" "$client_port" "$local_server" "$server_port"
-    else
-        printf "\r\033[K"
-        warn "${BOLD}${session_name}${RESET} created but tunnel failed"
-        hint "Try: beam ${space} up"
-    fi
-    echo ""
+    activate_and_report "$space" "$session_name" "$host" "$local_client" "$client_port" "$local_server" "$server_port" "created and live"
 }
 
 cmd_session_ls() {
@@ -752,13 +824,7 @@ cmd_session_ls() {
 
     local state
     state=$(read_state)
-
-    local exists
-    exists=$(echo "$state" | jq -r ".spaces[\"$space\"] // \"null\"")
-    if [[ "$exists" == "null" ]]; then
-        err "Space '${space}' does not exist."
-        exit 1
-    fi
+    require_space "$state" "$space"
 
     local sessions
     sessions=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions // {} | keys[]" 2>/dev/null || true)
@@ -776,23 +842,18 @@ cmd_session_ls() {
     echo ""
 
     while IFS= read -r session; do
-        local s_host s_status lc ls_port rc rs
-        s_host=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].host")
-        s_status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].status")
-        lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_client_port")
-        ls_port=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_server_port")
-        rc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_client_port")
-        rs=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_server_port")
+        local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+        IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
         local indicator status_str ports
         if [[ "$s_status" == "live" ]]; then
             indicator="${GREEN}●${RESET}"
             status_str="${GREEN}live${RESET}"
-            ports="${lc}:${rc}, ${ls_port}:${rs}"
+            ports="${s_lc}:${s_rc}, ${s_ls}:${s_rs}"
         else
             indicator="${DIM}○${RESET}"
             status_str="${DIM}dormant${RESET}"
-            ports="${DIM}${lc}:${rc}, ${ls_port}:${rs}${RESET}"
+            ports="${DIM}${s_lc}:${s_rc}, ${s_ls}:${s_rs}${RESET}"
         fi
 
         printf "  %b  %-32s ${DIM}%-18s${RESET} %-20b %b\n" "$indicator" "$session" "$s_host" "$ports" "$status_str"
@@ -800,12 +861,15 @@ cmd_session_ls() {
     echo ""
 }
 
-cmd_session_up() {
+# Shared implementation for up/switch commands.
+cmd_session_activate() {
     local space="$1"
     local session="${2:-}"
+    local success_msg="${3:-is live}"
+    local selector_label="${4:-Activate session}"
 
     if [[ -z "$session" ]]; then
-        printf "\n  ${BOLD}Activate session${RESET} ${DIM}(${space})${RESET}\n"
+        printf "\n  ${BOLD}%s${RESET} ${DIM}(${space})${RESET}\n" "$selector_label"
         session=$(select_session "$space" "dormant")
         if [[ -z "$session" ]]; then
             hint "No dormant sessions."
@@ -816,57 +880,26 @@ cmd_session_up() {
 
     local state
     state=$(read_state)
+    require_space "$state" "$space"
+    require_session "$state" "$space" "$session"
 
-    local exists
-    exists=$(echo "$state" | jq -r ".spaces[\"$space\"] // \"null\"")
-    if [[ "$exists" == "null" ]]; then
-        err "Space '${space}' does not exist."
-        exit 1
-    fi
+    local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+    IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
-    local session_data
-    session_data=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"] // \"null\"")
-    if [[ "$session_data" == "null" ]]; then
-        err "Session '${session}' does not exist in space '${space}'."
-        exit 1
-    fi
-
-    local status
-    status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].status")
-    if [[ "$status" == "live" ]]; then
+    if [[ "$s_status" == "live" ]]; then
         echo ""
         hint "Already live."
         echo ""
         return
     fi
 
-    local host lc ls rc rs
-    host=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].host")
-    lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_client_port")
-    ls=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_server_port")
-    rc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_client_port")
-    rs=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_server_port")
+    check_and_resolve_conflicts "$s_lc" "$s_ls" "$space" "$session" || return
 
-    local conflict
-    conflict=$(find_port_conflicts "$lc" "$ls" "$space" "$session")
-    if [[ -n "$conflict" ]]; then
-        local conflict_space conflict_session
-        conflict_space=$(echo "$conflict" | cut -d: -f1)
-        conflict_session=$(echo "$conflict" | cut -d: -f2-)
-        resolve_conflict "$state" "$conflict_space" "$conflict_session" || return
-    fi
+    activate_and_report "$space" "$session" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs" "$success_msg"
+}
 
-    echo ""
-    printf "  ${DIM}Connecting...${RESET}"
-    if activate_session "$space" "$session" "$host" "$lc" "$rc" "$ls" "$rs"; then
-        printf "\r\033[K"
-        ok "${BOLD}${session}${RESET} is live"
-        print_ports "$host" "$lc" "$rc" "$ls" "$rs"
-    else
-        printf "\r\033[K"
-        err "Failed to start tunnel."
-    fi
-    echo ""
+cmd_session_up() {
+    cmd_session_activate "$1" "${2:-}" "is live" "Activate session"
 }
 
 cmd_session_down() {
@@ -885,39 +918,20 @@ cmd_session_down() {
 
     local state
     state=$(read_state)
+    require_space "$state" "$space"
+    require_session "$state" "$space" "$session"
 
-    local exists
-    exists=$(echo "$state" | jq -r ".spaces[\"$space\"] // \"null\"")
-    if [[ "$exists" == "null" ]]; then
-        err "Space '${space}' does not exist."
-        exit 1
-    fi
+    local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+    IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
-    local session_data
-    session_data=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"] // \"null\"")
-    if [[ "$session_data" == "null" ]]; then
-        err "Session '${session}' does not exist in space '${space}'."
-        exit 1
-    fi
-
-    local status
-    status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].status")
-    if [[ "$status" == "dormant" ]]; then
+    if [[ "$s_status" == "dormant" ]]; then
         echo ""
         hint "Already dormant."
         echo ""
         return
     fi
 
-    local pid lc ls
-    pid=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].pid // \"null\"")
-    lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_client_port")
-    ls=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_server_port")
-    kill_tunnel "$pid" "$lc" "$ls"
-
-    state=$(read_state)
-    state=$(echo "$state" | jq ".spaces[\"$space\"].sessions[\"$session\"].status = \"dormant\" | .spaces[\"$space\"].sessions[\"$session\"].pid = null")
-    write_state "$state"
+    sleep_session "$space" "$session"
     echo ""
     printf "  ${DIM}○${RESET} ${BOLD}%s${RESET} slept\n" "$session"
     echo ""
@@ -939,28 +953,14 @@ cmd_session_rm() {
 
     local state
     state=$(read_state)
+    require_space "$state" "$space"
+    require_session "$state" "$space" "$session"
 
-    local exists
-    exists=$(echo "$state" | jq -r ".spaces[\"$space\"] // \"null\"")
-    if [[ "$exists" == "null" ]]; then
-        err "Space '${space}' does not exist."
-        exit 1
-    fi
+    local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+    IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
-    local session_data
-    session_data=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"] // \"null\"")
-    if [[ "$session_data" == "null" ]]; then
-        err "Session '${session}' does not exist in space '${space}'."
-        exit 1
-    fi
-
-    local status pid lc ls
-    status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].status")
-    pid=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].pid // \"null\"")
-    lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_client_port")
-    ls=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_server_port")
-    if [[ "$status" == "live" && "$pid" != "null" ]]; then
-        kill_tunnel "$pid" "$lc" "$ls"
+    if [[ "$s_status" == "live" && "$s_pid" != "null" ]]; then
+        kill_tunnel "$s_pid" "$s_lc" "$s_ls"
     fi
 
     state=$(read_state)
@@ -972,72 +972,7 @@ cmd_session_rm() {
 }
 
 cmd_session_switch() {
-    local space="$1"
-    local session="${2:-}"
-
-    if [[ -z "$session" ]]; then
-        printf "\n  ${BOLD}Switch session${RESET} ${DIM}(${space})${RESET}\n"
-        session=$(select_session "$space" "dormant")
-        if [[ -z "$session" ]]; then
-            hint "No dormant sessions."
-            echo ""
-            return
-        fi
-    fi
-
-    local state
-    state=$(read_state)
-
-    local exists
-    exists=$(echo "$state" | jq -r ".spaces[\"$space\"] // \"null\"")
-    if [[ "$exists" == "null" ]]; then
-        err "Space '${space}' does not exist."
-        exit 1
-    fi
-
-    local session_data
-    session_data=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"] // \"null\"")
-    if [[ "$session_data" == "null" ]]; then
-        err "Session '${session}' does not exist in space '${space}'."
-        exit 1
-    fi
-
-    local status
-    status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].status")
-    if [[ "$status" == "live" ]]; then
-        echo ""
-        hint "Already live."
-        echo ""
-        return
-    fi
-
-    local host lc ls rc rs
-    host=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].host")
-    lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_client_port")
-    ls=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_server_port")
-    rc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_client_port")
-    rs=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_server_port")
-
-    local conflict
-    conflict=$(find_port_conflicts "$lc" "$ls" "$space" "$session")
-    if [[ -n "$conflict" ]]; then
-        local conflict_space conflict_session
-        conflict_space=$(echo "$conflict" | cut -d: -f1)
-        conflict_session=$(echo "$conflict" | cut -d: -f2-)
-        resolve_conflict "$state" "$conflict_space" "$conflict_session" || return
-    fi
-
-    echo ""
-    printf "  ${DIM}Connecting...${RESET}"
-    if activate_session "$space" "$session" "$host" "$lc" "$rc" "$ls" "$rs"; then
-        printf "\r\033[K"
-        ok "Switched to ${BOLD}${session}${RESET}"
-        print_ports "$host" "$lc" "$rc" "$ls" "$rs"
-    else
-        printf "\r\033[K"
-        err "Failed to start tunnel."
-    fi
-    echo ""
+    cmd_session_activate "$1" "${2:-}" "Switched to" "Switch session"
 }
 
 # --- Dashboard ---
@@ -1077,25 +1012,19 @@ cmd_dashboard() {
         fi
 
         while IFS= read -r session; do
-            local s_status pid lc ls_port rc rs s_host
-            s_status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].status")
-            pid=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].pid // \"null\"")
-            s_host=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].host")
-            lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_client_port")
-            ls_port=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_server_port")
-            rc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_client_port")
-            rs=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_server_port")
+            local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+            IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
             if [[ "$s_status" == "live" ]]; then
                 local health
-                health=$(check_health "$pid" "$lc" "$ls_port")
+                health=$(check_health "$s_pid" "$s_lc" "$s_ls")
                 if [[ "$health" == "healthy" ]]; then
                     printf "  ${GREEN}●${RESET}  %-32s ${DIM}%s${RESET}  %s:%s, %s:%s  ${GREEN}healthy${RESET}\n" \
-                        "$session" "$s_host" "$lc" "$rc" "$ls_port" "$rs"
+                        "$session" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs"
                 else
                     has_dead=true
                     printf "  ${RED}●${RESET}  %-32s ${DIM}%s${RESET}  %s:%s, %s:%s  ${BOLD_RED}DEAD${RESET}\n" \
-                        "$session" "$s_host" "$lc" "$rc" "$ls_port" "$rs"
+                        "$session" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs"
                 fi
             else
                 printf "  ${DIM}○${RESET}  ${DIM}%-32s %s${RESET}\n" "$session" "$s_host"
@@ -1137,22 +1066,15 @@ cmd_hydrate() {
         [[ -z "$sessions" ]] && continue
 
         while IFS= read -r session; do
-            local s_status
-            s_status=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].status")
+            local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
+            IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+
             [[ "$s_status" != "live" ]] && continue
 
             found_live=true
 
-            local pid lc ls rc rs host
-            pid=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].pid // \"null\"")
-            lc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_client_port")
-            ls=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].local_server_port")
-            rc=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_client_port")
-            rs=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].remote_server_port")
-            host=$(echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].host")
-
             local health
-            health=$(check_health "$pid" "$lc" "$ls")
+            health=$(check_health "$s_pid" "$s_lc" "$s_ls")
 
             if [[ "$health" == "healthy" ]]; then
                 printf "  ${GREEN}●${RESET}  %s  ${DIM}already healthy${RESET}\n" "$session"
@@ -1161,7 +1083,7 @@ cmd_hydrate() {
 
             local port_conflict=false
             for hp in "${hydrated_ports[@]:-}"; do
-                if [[ "$hp" == "$lc" || "$hp" == "$ls" ]]; then
+                if [[ "$hp" == "$s_lc" || "$hp" == "$s_ls" ]]; then
                     port_conflict=true
                     break
                 fi
@@ -1172,19 +1094,13 @@ cmd_hydrate() {
                 continue
             fi
 
-            if [[ "$pid" != "null" ]]; then
-                kill_tunnel "$pid" "$lc" "$ls"
+            if [[ "$s_pid" != "null" ]]; then
+                kill_tunnel "$s_pid" "$s_lc" "$s_ls"
             fi
 
             printf "  ${DIM}…${RESET}  %s  ${DIM}reconnecting${RESET}" "$session"
-            local new_pid=""
-            new_pid=$(start_tunnel "$host" "$lc" "$rc" "$ls" "$rs" 2>&1) || true
-
-            if [[ -n "$new_pid" && "$new_pid" != "" ]]; then
-                state=$(read_state)
-                state=$(echo "$state" | jq ".spaces[\"$space\"].sessions[\"$session\"].pid = $new_pid")
-                write_state "$state"
-                hydrated_ports+=("$lc" "$ls")
+            if activate_session "$space" "$session" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs"; then
+                hydrated_ports+=("$s_lc" "$s_ls")
                 printf "\r\033[K  ${GREEN}●${RESET}  %s  ${GREEN}reconnected${RESET}\n" "$session"
             else
                 printf "\r\033[K  ${RED}✗${RESET}  %s  ${RED}failed${RESET}\n" "$session"
@@ -1219,6 +1135,9 @@ show_usage() {
 
 # --- Subcommand routing ---
 
+# Guard: skip main execution when sourced (for testing)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+
 init_state
 
 case "${1:-}" in
@@ -1228,7 +1147,7 @@ case "${1:-}" in
     help|--help|-h)
         show_usage
         ;;
-    space)
+    space|spaces)
         case "${2:-}" in
             ls)
                 cmd_space_ls
@@ -1272,10 +1191,12 @@ case "${1:-}" in
             switch)
                 cmd_session_switch "$local_space" "$local_session"
                 ;;
-            *)
-                show_usage
-                exit 1
-                ;;
-        esac
-        ;;
+        *)
+            show_usage
+            exit 1
+            ;;
+    esac
+    ;;
 esac
+
+fi # end source guard
