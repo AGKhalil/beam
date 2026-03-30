@@ -65,30 +65,59 @@ helper_create_space() {
     write_state "$state"
 }
 
-# Helper: add a session to a space in state
+# Default ports JSON for tests
+DEFAULT_TEST_PORTS='[{"local":3000,"remote":12225,"service":"wasp"},{"local":3001,"remote":11570,"service":"wasp"}]'
+
+# Helper: add a session to a space in state (new ports-array format)
+# Usage: helper_add_session SPACE SESSION [HOST] [STATUS] [PID] [PORTS_JSON]
+# PORTS_JSON defaults to a standard 2-port wasp config
 helper_add_session() {
     local space="$1"
     local session="$2"
     local host="${3:-testhost}"
     local status="${4:-dormant}"
     local pid="${5:-null}"
-    local lc="${6:-3000}"
-    local ls="${7:-3001}"
-    local rc="${8:-12225}"
-    local rs="${9:-11570}"
+    local ports_json="${6:-$DEFAULT_TEST_PORTS}"
 
     local state
     state=$(read_state)
-    state=$(echo "$state" | jq ".spaces[\"$space\"].sessions[\"$session\"] = {
+    state=$(echo "$state" | jq --argjson ports "$ports_json" ".spaces[\"$space\"].sessions[\"$session\"] = {
         \"host\": \"$host\",
         \"project\": \"testproj\",
         \"worktree\": \"testproj.wt\",
-        \"remote_client_port\": $rc,
-        \"remote_server_port\": $rs,
-        \"local_client_port\": $lc,
-        \"local_server_port\": $ls,
+        \"ports\": \$ports,
         \"status\": \"$status\",
         \"pid\": $pid
     }")
     write_state "$state"
 }
+
+# Sample compose content for testing
+SAMPLE_COMPOSE='version: "3.8"
+
+services:
+  db:
+    image: postgres:16
+    ports:
+      - "${DB_PORT:-5432}:5432"
+
+  wasp:
+    build: .
+    ports:
+      - "${WASP_CLIENT_PORT:-3000}:3000"
+      - "${WASP_SERVER_PORT:-3001}:3001"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6381}:6379"
+
+  worker:
+    build: ./pops
+    # no ports
+
+  api:
+    build: ./pops
+    ports:
+      - "8080:8000"
+'

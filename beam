@@ -1,5 +1,5 @@
 #!/bin/bash
-# beam - Session-based SSH tunnel manager for Wasp projects
+# beam - Session-based SSH tunnel manager with docker-compose port discovery
 
 set -euo pipefail
 
@@ -111,12 +111,27 @@ require_session() {
     fi
 }
 
-# Read all session fields in one jq call. Returns tab-separated:
-# host status pid local_client_port remote_client_port local_server_port remote_server_port project worktree
+# Read core session fields in one jq call. Returns tab-separated:
+# host status pid project worktree
+# Ports are stored as a JSON array; use read_session_ports() to access them.
+# Sessions with old format (no ports array) return empty ports.
 read_session() {
     local state="$1" space="$2" session="$3"
     echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"] |
-        [.host, .status, (.pid // \"null\" | tostring), (.local_client_port|tostring), (.remote_client_port|tostring), (.local_server_port|tostring), (.remote_server_port|tostring), .project, .worktree] | @tsv"
+        [.host, .status, (.pid // \"null\" | tostring), .project, .worktree] | @tsv"
+}
+
+# Read a session's ports as a JSON array.
+# Returns "[]" for sessions with old format or missing ports.
+read_session_ports() {
+    local state="$1" space="$2" session="$3"
+    echo "$state" | jq -c ".spaces[\"$space\"].sessions[\"$session\"].ports // []"
+}
+
+# Get all local ports from a session's ports array as newline-separated list.
+read_session_local_ports() {
+    local state="$1" space="$2" session="$3"
+    echo "$state" | jq -r ".spaces[\"$space\"].sessions[\"$session\"].ports // [] | .[].local"
 }
 
 # Kill a session's tunnel and mark it dormant in state.
@@ -125,11 +140,13 @@ sleep_session() {
 
     local state
     state=$(read_state)
-    local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-    IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+    local s_host s_status s_pid s_project s_worktree
+    IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
     if [[ "$s_status" == "live" && "$s_pid" != "null" ]]; then
-        kill_tunnel "$s_pid" "$s_lc" "$s_ls"
+        local ports_json
+        ports_json=$(read_session_ports "$state" "$space" "$session")
+        kill_tunnel "$s_pid" "$ports_json"
     fi
 
     state=$(read_state)
@@ -138,11 +155,12 @@ sleep_session() {
 }
 
 # Check for port conflicts and resolve them. Returns 0 if no conflict or resolved, 1 if user cancelled.
+# $1 = ports JSON array, $2 = space, $3 = session (to exclude from check)
 check_and_resolve_conflicts() {
-    local lc="$1" ls="$2" space="$3" session="$4"
+    local ports_json="$1" space="$2" session="$3"
 
     local conflict
-    conflict=$(find_port_conflicts "$lc" "$ls" "$space" "$session")
+    conflict=$(find_port_conflicts "$ports_json" "$space" "$session")
     if [[ -n "$conflict" ]]; then
         local state
         state=$(read_state)
@@ -157,14 +175,14 @@ check_and_resolve_conflicts() {
 
 # Activate a session tunnel and print the result.
 activate_and_report() {
-    local space="$1" session="$2" host="$3" lc="$4" rc="$5" ls="$6" rs="$7" success_msg="$8"
+    local space="$1" session="$2" host="$3" ports_json="$4" success_msg="$5"
 
     echo ""
     printf "  ${DIM}Connecting...${RESET}"
-    if activate_session "$space" "$session" "$host" "$lc" "$rc" "$ls" "$rs"; then
+    if activate_session "$space" "$session" "$host" "$ports_json"; then
         printf "\r\033[K"
         ok "${BOLD}${session}${RESET} ${success_msg}"
-        print_ports "$host" "$lc" "$rc" "$ls" "$rs"
+        print_ports "$host" "$ports_json"
     else
         printf "\r\033[K"
         err "Failed to start tunnel for ${BOLD}${session}${RESET}."
@@ -301,8 +319,8 @@ select_session() {
     declare -a candidates
     declare -a display_lines
     while IFS= read -r s; do
-        local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-        IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$s")"
+        local s_host s_status s_pid s_project s_worktree
+        IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$s")"
 
         if [[ -n "$filter" ]]; then
             [[ "$s_status" != "$filter" ]] && continue
@@ -316,8 +334,10 @@ select_session() {
             indicator="${DIM}○${RESET}"
         fi
 
-        display_lines+=("$(printf "%b  %-30s ${DIM}%s${RESET}  ${DIM}%s:%s, %s:%s${RESET}" \
-            "$indicator" "$s" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs")")
+        local port_count
+        port_count=$(echo "$state" | jq ".spaces[\"$space\"].sessions[\"$s\"].ports // [] | length")
+        display_lines+=("$(printf "%b  %-30s ${DIM}%s${RESET}  ${DIM}%d ports${RESET}" \
+            "$indicator" "$s" "$s_host" "$port_count")")
     done <<< "$sessions"
 
     if [[ ${#candidates[@]} -eq 0 ]]; then
@@ -341,22 +361,123 @@ select_session() {
 
 
 
+# --- Compose port discovery ---
+
+# Parse docker-compose.dev.yml port mappings.
+# Input: raw compose file content (stdin or $1)
+# Output: one line per port: SERVICE|VAR_NAME|DEFAULT|CONTAINER_PORT
+#   - VAR_NAME is empty for literal ports
+#   - DEFAULT is the fallback value (or the literal host port)
+# Skips unrecognized port formats with a warning to stderr.
+parse_compose_ports() {
+    local compose_content="$1"
+    local current_service=""
+    local in_ports=false
+    local results=""
+
+    while IFS= read -r line; do
+        # Detect service name (top-level key under services, 2-space indent)
+        if [[ "$line" =~ ^[[:space:]]{2}[a-zA-Z_][a-zA-Z0-9_-]*:[[:space:]]*$ ]]; then
+            current_service=$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/:.*//')
+            in_ports=false
+            continue
+        fi
+
+        # Detect ports: section (4-space indent)
+        if [[ "$line" =~ ^[[:space:]]{4}ports:[[:space:]]*$ ]]; then
+            in_ports=true
+            continue
+        fi
+
+        # Exit ports section on any non-list-item at 4+ indent or new section
+        if [[ "$in_ports" == true ]]; then
+            # Port list items are at 6-space indent with "- "
+            if [[ "$line" =~ ^[[:space:]]{6}-[[:space:]] ]]; then
+                local port_val
+                port_val=$(echo "$line" | sed 's/^[[:space:]]*-[[:space:]]*//' | tr -d '"' | tr -d "'")
+
+                # Pattern 1: ${VAR:-DEFAULT}:CONTAINER
+                if [[ "$port_val" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*):-([0-9]+)\}:([0-9]+)$ ]]; then
+                    local var_name="${BASH_REMATCH[1]}"
+                    local default_val="${BASH_REMATCH[2]}"
+                    results+="${current_service}|${var_name}|${default_val}"$'\n'
+                # Pattern 2: LITERAL_HOST:CONTAINER (both numeric)
+                elif [[ "$port_val" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                    local host_port="${BASH_REMATCH[1]}"
+                    results+="${current_service}||${host_port}"$'\n'
+                else
+                    warn "Skipping unrecognized port format in service '${current_service}': ${port_val}" >&2
+                fi
+            elif [[ ! "$line" =~ ^[[:space:]]*$ ]]; then
+                # Non-empty, non-list-item line = end of ports section
+                in_ports=false
+            fi
+        fi
+    done <<< "$compose_content"
+
+    # Output results (strip trailing empty line)
+    if [[ -n "$results" ]]; then
+        echo "$results" | sed '/^$/d'
+    fi
+}
+
+# Resolve parsed compose ports against .env to produce JSON array.
+# Input: $1 = parsed port lines (from parse_compose_ports), $2 = .env content (may be empty)
+# Output: JSON array of [{local, remote, service}]
+resolve_ports() {
+    local parsed_ports="$1"
+    local env_content="${2:-}"
+
+    local json_arr="["
+    local first=true
+
+    while IFS='|' read -r service var_name default_val; do
+        [[ -z "$service" && -z "$default_val" ]] && continue
+
+        local local_port="$default_val"
+        local remote_port="$default_val"
+
+        # If there's a variable name, try to resolve from .env
+        if [[ -n "$var_name" && -n "$env_content" ]]; then
+            local env_val
+            env_val=$(echo "$env_content" | grep "^${var_name}=" | head -1 | cut -d= -f2 | tr -d '[:space:]')
+            if [[ -n "$env_val" ]]; then
+                remote_port="$env_val"
+            fi
+        fi
+
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            json_arr+=","
+        fi
+        json_arr+="{\"local\":${local_port},\"remote\":${remote_port},\"service\":\"${service}\"}"
+    done <<< "$parsed_ports"
+
+    json_arr+="]"
+    echo "$json_arr"
+}
+
 # --- Tunnel core ---
 
 start_tunnel() {
     local host="$1"
-    local local_client="$2"
-    local remote_client="$3"
-    local local_server="$4"
-    local remote_server="$5"
+    local ports_json="$2"
+
+    # Build -L flags dynamically
+    local ssh_args=()
+    ssh_args+=(-fN -o ServerAliveInterval=30 -o ServerAliveCountMax=3)
+
+    local first_local=""
+    while IFS=$'\t' read -r local_port remote_port; do
+        ssh_args+=(-L "${local_port}:localhost:${remote_port}")
+        [[ -z "$first_local" ]] && first_local="$local_port"
+    done < <(echo "$ports_json" | jq -r '.[] | [(.local|tostring), (.remote|tostring)] | @tsv')
+
+    ssh_args+=("$host")
 
     local ssh_exit=0
-    ssh -fN \
-        -o ServerAliveInterval=30 \
-        -o ServerAliveCountMax=3 \
-        -L "${local_client}:localhost:${remote_client}" \
-        -L "${local_server}:localhost:${remote_server}" \
-        "$host" 2>/dev/null || ssh_exit=$?
+    ssh "${ssh_args[@]}" 2>/dev/null || ssh_exit=$?
 
     if [[ "$ssh_exit" -ne 0 ]]; then
         echo ""
@@ -366,28 +487,28 @@ start_tunnel() {
     sleep 0.5
 
     local pid
-    pid=$(pgrep -n -f "ssh.*-L ${local_client}:localhost:${remote_client}.*${host}" 2>/dev/null || true)
+    pid=$(pgrep -n -f "ssh.*-L ${first_local}:localhost:.*${host}" 2>/dev/null || true)
 
     if [[ -z "$pid" ]]; then
         echo ""
         return 1
     fi
 
-    # Verify our local forwards are actually listening
-    if ! lsof -i ":${local_client}" -sTCP:LISTEN &>/dev/null || \
-       ! lsof -i ":${local_server}" -sTCP:LISTEN &>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        echo ""
-        return 1
-    fi
+    # Verify all local forwards are actually listening
+    while IFS= read -r lp; do
+        if ! lsof -i ":${lp}" -sTCP:LISTEN &>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            echo ""
+            return 1
+        fi
+    done < <(echo "$ports_json" | jq -r '.[].local')
 
     echo "$pid"
 }
 
 kill_tunnel() {
     local pid="$1"
-    local local_client="${2:-}"
-    local local_server="${3:-}"
+    local ports_json="${2:-[]}"
 
     if [[ -z "$pid" || "$pid" == "null" ]]; then
         return 0
@@ -402,49 +523,45 @@ kill_tunnel() {
         done
     fi
 
-    if [[ -n "$local_client" ]]; then
+    # Wait for each local port to release
+    while IFS= read -r lp; do
+        [[ -z "$lp" ]] && continue
         local i=0
-        while lsof -i ":${local_client}" -sTCP:LISTEN &>/dev/null && [[ $i -lt 30 ]]; do
+        while lsof -i ":${lp}" -sTCP:LISTEN &>/dev/null && [[ $i -lt 30 ]]; do
             sleep 0.1
             ((i++))
         done
-    fi
-    if [[ -n "$local_server" ]]; then
-        local i=0
-        while lsof -i ":${local_server}" -sTCP:LISTEN &>/dev/null && [[ $i -lt 30 ]]; do
-            sleep 0.1
-            ((i++))
-        done
-    fi
+    done < <(echo "$ports_json" | jq -r '.[].local // empty')
 }
 
 check_health() {
     local pid="$1"
-    local local_client="$2"
-    local local_server="$3"
+    local ports_json="$2"
 
     if [[ -z "$pid" || "$pid" == "null" ]] || ! kill -0 "$pid" 2>/dev/null; then
         echo "dead"
         return
     fi
 
-    if ! lsof -i ":${local_client}" -sTCP:LISTEN &>/dev/null; then
-        echo "dead"
-        return
-    fi
-    if ! lsof -i ":${local_server}" -sTCP:LISTEN &>/dev/null; then
-        echo "dead"
-        return
-    fi
+    while IFS= read -r lp; do
+        [[ -z "$lp" ]] && continue
+        if ! lsof -i ":${lp}" -sTCP:LISTEN &>/dev/null; then
+            echo "dead"
+            return
+        fi
+    done < <(echo "$ports_json" | jq -r '.[].local // empty')
 
     echo "healthy"
 }
 
 find_port_conflicts() {
-    local target_local_client="$1"
-    local target_local_server="$2"
-    local exclude_space="${3:-}"
-    local exclude_session="${4:-}"
+    local target_ports_json="$1"
+    local exclude_space="${2:-}"
+    local exclude_session="${3:-}"
+
+    # Build a lookup of target local ports
+    local target_ports
+    target_ports=$(echo "$target_ports_json" | jq -r '.[].local')
 
     local state
     state=$(read_state)
@@ -460,17 +577,25 @@ find_port_conflicts() {
                 continue
             fi
 
-            local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-            IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+            local s_host s_status s_pid s_project s_worktree
+            IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
             if [[ "$s_status" != "live" ]]; then
                 continue
             fi
 
-            if [[ "$s_lc" == "$target_local_client" || "$s_ls" == "$target_local_server" || "$s_lc" == "$target_local_server" || "$s_ls" == "$target_local_client" ]]; then
-                echo "${space}:${session}"
-                return
-            fi
+            local existing_ports
+            existing_ports=$(read_session_local_ports "$state" "$space" "$session")
+
+            # Check for any overlap
+            for tp in $target_ports; do
+                for ep in $existing_ports; do
+                    if [[ "$tp" == "$ep" ]]; then
+                        echo "${space}:${session}"
+                        return
+                    fi
+                done
+            done
         done
     done
 }
@@ -484,11 +609,11 @@ resolve_conflict() {
 
     echo ""
     warn "Port conflict with ${BOLD}${conflict_session}${RESET} ${DIM}(${conflict_space})${RESET}"
-    printf "  Sleep it? ${DIM}(y/n)${RESET} "
+    printf "  Tear it down? ${DIM}(y/N)${RESET} "
     read -r answer </dev/tty
     if [[ "$answer" == "y" || "$answer" == "Y" ]]; then
         sleep_session "$conflict_space" "$conflict_session"
-        printf "  ${DIM}○${RESET} %s slept\n" "$conflict_session"
+        printf "  ${DIM}○${RESET} %s torn down\n" "$conflict_session"
         return 0
     else
         hint "Cancelled."
@@ -502,13 +627,10 @@ activate_session() {
     local space="$1"
     local session="$2"
     local host="$3"
-    local lc="$4"
-    local rc="$5"
-    local ls="$6"
-    local rs="$7"
+    local ports_json="$4"
 
     local raw_pid=""
-    raw_pid=$(start_tunnel "$host" "$lc" "$rc" "$ls" "$rs" 2>/dev/null) || true
+    raw_pid=$(start_tunnel "$host" "$ports_json" 2>/dev/null) || true
 
     # Sanitize: extract only the numeric PID (strip any SSH warnings that leaked into stdout)
     local pid=""
@@ -525,11 +647,31 @@ activate_session() {
     fi
 }
 
-# Helper: print port mapping line
+# Helper: print port mapping lines from ports JSON array
 print_ports() {
-    local host="$1" lc="$2" rc="$3" ls="$4" rs="$5"
-    printf "  ${DIM}localhost${RESET}:${BOLD_WHITE}%s${RESET} ${SYM_ARROW} %s:${DIM}%s${RESET}  ${DIM}(client)${RESET}\n" "$lc" "$host" "$rc"
-    printf "  ${DIM}localhost${RESET}:${BOLD_WHITE}%s${RESET} ${SYM_ARROW} %s:${DIM}%s${RESET}  ${DIM}(server)${RESET}\n" "$ls" "$host" "$rs"
+    local host="$1" ports_json="$2"
+    while IFS=$'\t' read -r local_port remote_port service; do
+        printf "  ${DIM}localhost${RESET}:${BOLD_WHITE}%s${RESET} ${SYM_ARROW} %s:${DIM}%s${RESET}  ${DIM}(%s)${RESET}\n" "$local_port" "$host" "$remote_port" "$service"
+    done < <(echo "$ports_json" | jq -r '.[] | [(.local|tostring), (.remote|tostring), .service] | @tsv')
+}
+
+# --- Space host memory ---
+
+# Get known hosts for a space. Returns JSON array (empty if missing).
+get_space_hosts() {
+    local state="$1" space="$2"
+    echo "$state" | jq -c ".spaces[\"$space\"].hosts // []"
+}
+
+# Add a host to a space's known hosts (no-op if already present).
+add_space_host() {
+    local space="$1" host="$2"
+    local state
+    state=$(read_state)
+    state=$(echo "$state" | jq "
+        .spaces[\"$space\"].hosts = ((.spaces[\"$space\"].hosts // []) + [\"$host\"] | unique)
+    ")
+    write_state "$state"
 }
 
 # --- Space management ---
@@ -576,7 +718,7 @@ cmd_space_create() {
         exit 1
     fi
 
-    state=$(echo "$state" | jq ".spaces[\"$name\"] = {\"sessions\": {}}")
+    state=$(echo "$state" | jq ".spaces[\"$name\"] = {\"hosts\": [], \"sessions\": {}}")
     write_state "$state"
     echo ""
     ok "Space ${BOLD}${name}${RESET} created"
@@ -610,10 +752,12 @@ cmd_space_rm() {
         local sessions
         sessions=$(echo "$state" | jq -r ".spaces[\"$name\"].sessions | keys[]" 2>/dev/null || true)
         for session in $sessions; do
-            local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-            IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$name" "$session")"
+            local s_host s_status s_pid s_project s_worktree
+            IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$name" "$session")"
             if [[ "$s_status" == "live" && "$s_pid" != "null" ]]; then
-                kill_tunnel "$s_pid" "$s_lc" "$s_ls"
+                local ports_json
+                ports_json=$(read_session_ports "$state" "$name" "$session")
+                kill_tunnel "$s_pid" "$ports_json"
                 printf "  ${DIM}○${RESET} killed %s\n" "$session"
             fi
         done
@@ -636,9 +780,43 @@ cmd_session_create() {
     state=$(read_state)
     require_space "$state" "$space"
 
-    echo ""
-    printf "  ${BOLD}SSH host${RESET} ${DIM}(e.g. ag@hetzner1)${RESET}: "
-    read -r host
+    # Host selection: offer known hosts or prompt for new
+    local known_hosts_json
+    known_hosts_json=$(get_space_hosts "$state" "$space")
+    local known_count
+    known_count=$(echo "$known_hosts_json" | jq 'length')
+
+    local host=""
+    if [[ "$known_count" -eq 0 ]]; then
+        # No known hosts — raw prompt
+        echo ""
+        printf "  ${BOLD}SSH host${RESET} ${DIM}(e.g. ag@hetzner1)${RESET}: "
+        read -r host
+    else
+        # Known hosts — arrow select with "new host" option
+        echo ""
+        label "  SSH host"
+
+        declare -a host_arr host_display
+        while IFS= read -r h; do
+            host_arr+=("$h")
+            host_display+=("$h")
+        done < <(echo "$known_hosts_json" | jq -r '.[]')
+
+        host_arr+=("__new__")
+        host_display+=("${DIM}+ Enter a new host...${RESET}")
+
+        local host_idx
+        if host_idx=$(printf '%s\n' "${host_display[@]}" | arrow_select); then
+            if [[ "${host_arr[$host_idx]}" == "__new__" ]]; then
+                printf "  ${BOLD}SSH host${RESET} ${DIM}(e.g. ag@hetzner1)${RESET}: "
+                read -r host
+            else
+                host="${host_arr[$host_idx]}"
+            fi
+        fi
+    fi
+
     if [[ -z "$host" ]]; then
         err "SSH host is required."
         exit 1
@@ -713,12 +891,13 @@ cmd_session_create() {
         exit 1
     fi
 
-    local grep_cmd=""
+    # Preview: count services from compose files
+    local count_cmd=""
     for wt in "${wt_arr[@]}"; do
-        grep_cmd="${grep_cmd}echo \"${wt}|\$(grep '^WASP_CLIENT_PORT=' ~/codebases/${wt}/.env 2>/dev/null | cut -d= -f2 || echo none)\";"
+        count_cmd="${count_cmd}echo \"${wt}|\$(grep -c '^\\ \\{6\\}- ' ~/codebases/${wt}/docker-compose.dev.yml 2>/dev/null || echo 0)\";"
     done
-    local wt_ports
-    wt_ports=$(ssh -o ConnectTimeout=10 -o ClearAllForwardings=yes "$host" "$grep_cmd" 2>/dev/null)
+    local wt_counts
+    wt_counts=$(ssh -o ConnectTimeout=10 -o ClearAllForwardings=yes "$host" "$count_cmd" 2>/dev/null)
 
     echo ""
     label "  Worktrees"
@@ -726,16 +905,16 @@ cmd_session_create() {
     declare -a wt_values wt_display
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        local wt port
+        local wt svc_count
         wt=$(echo "$line" | cut -d'|' -f1)
-        port=$(echo "$line" | cut -d'|' -f2 | tr -d '[:space:]')
+        svc_count=$(echo "$line" | cut -d'|' -f2 | tr -d '[:space:]')
         wt_values+=("$wt")
-        if [[ -n "$port" && "$port" != "none" ]]; then
-            wt_display+=("$(printf "%-30s ${DIM}client:%s${RESET}" "$wt" "$port")")
+        if [[ "$svc_count" -gt 0 ]]; then
+            wt_display+=("$(printf "%-30s ${DIM}%s services${RESET}" "$wt" "$svc_count")")
         else
-            wt_display+=("$(printf "%-30s ${DIM}no .env${RESET}" "$wt")")
+            wt_display+=("$(printf "%-30s ${DIM}no compose${RESET}" "$wt")")
         fi
-    done <<< "$wt_ports"
+    done <<< "$wt_counts"
 
     local worktree=""
     if [[ ${#wt_values[@]} -eq 1 ]]; then
@@ -751,31 +930,43 @@ cmd_session_create() {
         exit 1
     fi
 
-    local remote_env
-    remote_env=$(ssh -o ConnectTimeout=10 -o ClearAllForwardings=yes "$host" "cat ~/codebases/$worktree/.env 2>/dev/null" 2>/dev/null)
+    # Read compose file and .env from remote in one SSH call
+    local remote_data
+    remote_data=$(ssh -o ConnectTimeout=10 -o ClearAllForwardings=yes "$host" "
+        echo '===COMPOSE==='
+        cat ~/codebases/$worktree/docker-compose.dev.yml 2>/dev/null || echo '===NO_COMPOSE==='
+        echo '===ENV==='
+        cat ~/codebases/$worktree/.env 2>/dev/null || echo ''
+    " 2>/dev/null)
 
-    if [[ -z "$remote_env" ]]; then
-        err "Could not read ~/codebases/${worktree}/.env on ${host}"
+    local compose_content env_content
+    compose_content=$(echo "$remote_data" | sed -n '/^===COMPOSE===/,/^===ENV===/p' | sed '1d;$d')
+    env_content=$(echo "$remote_data" | sed -n '/^===ENV===/,$p' | sed '1d')
+
+    if [[ "$compose_content" == "===NO_COMPOSE===" || -z "$compose_content" ]]; then
+        err "No docker-compose.dev.yml found in ~/codebases/${worktree}/"
         exit 1
     fi
 
-    local client_port server_port
-    client_port=$(echo "$remote_env" | grep '^WASP_CLIENT_PORT=' | cut -d= -f2 | tr -d '[:space:]')
-    server_port=$(echo "$remote_env" | grep '^WASP_SERVER_PORT=' | cut -d= -f2 | tr -d '[:space:]')
+    local parsed_ports
+    parsed_ports=$(parse_compose_ports "$compose_content")
 
-    if [[ -z "$client_port" || -z "$server_port" ]]; then
-        err "Missing WASP_CLIENT_PORT or WASP_SERVER_PORT in .env"
+    if [[ -z "$parsed_ports" ]]; then
+        err "No port mappings found in docker-compose.dev.yml"
         exit 1
     fi
+
+    local ports_json
+    ports_json=$(resolve_ports "$parsed_ports" "$env_content")
+
+    local port_count
+    port_count=$(echo "$ports_json" | jq 'length')
 
     echo ""
-    printf "  ${DIM}Remote ports: client=%s, server=%s${RESET}\n" "$client_port" "$server_port"
-    printf "  ${BOLD}Local client port${RESET} ${DIM}[3000]${RESET}: "
-    read -r local_client
-    local_client="${local_client:-3000}"
-    printf "  ${BOLD}Local server port${RESET} ${DIM}[3001]${RESET}: "
-    read -r local_server
-    local_server="${local_server:-3001}"
+    printf "  ${DIM}Discovered %d port mappings:${RESET}\n" "$port_count"
+    while IFS=$'\t' read -r lp rp svc; do
+        printf "    ${DIM}%s${RESET}: localhost:${BOLD_WHITE}%s${RESET} ${SYM_ARROW} %s:${DIM}%s${RESET}\n" "$svc" "$lp" "$host" "$rp"
+    done < <(echo "$ports_json" | jq -r '.[] | [(.local|tostring), (.remote|tostring), .service] | @tsv')
 
     local session_name="${short_host}:${worktree}"
 
@@ -799,24 +990,26 @@ cmd_session_create() {
     fi
 
     # Check for port conflicts
-    check_and_resolve_conflicts "$local_client" "$local_server" "$space" "$session_name" || exit 0
+    check_and_resolve_conflicts "$ports_json" "$space" "$session_name" || exit 0
 
     # Create session in state
     state=$(read_state)
-    state=$(echo "$state" | jq ".spaces[\"$space\"].sessions[\"$session_name\"] = {
+    local ports_for_jq
+    ports_for_jq=$(echo "$ports_json" | jq -c '.')
+    state=$(echo "$state" | jq --argjson ports "$ports_for_jq" ".spaces[\"$space\"].sessions[\"$session_name\"] = {
         \"host\": \"$host\",
         \"project\": \"$project\",
         \"worktree\": \"$worktree\",
-        \"remote_client_port\": $client_port,
-        \"remote_server_port\": $server_port,
-        \"local_client_port\": $local_client,
-        \"local_server_port\": $local_server,
+        \"ports\": \$ports,
         \"status\": \"dormant\",
         \"pid\": null
     }")
     write_state "$state"
 
-    activate_and_report "$space" "$session_name" "$host" "$local_client" "$client_port" "$local_server" "$server_port" "created and live"
+    # Remember this host for future sessions in this space
+    add_space_host "$space" "$host"
+
+    activate_and_report "$space" "$session_name" "$host" "$ports_json" "created and live"
 }
 
 cmd_session_ls() {
@@ -838,35 +1031,37 @@ cmd_session_ls() {
     fi
 
     echo ""
-    printf "  ${DIM}%-2s  %-32s %-18s %-20s %s${RESET}\n" "" "SESSION" "HOST" "PORTS" "STATUS"
+    printf "  ${DIM}%-2s  %-32s %-18s %-10s %s${RESET}\n" "" "SESSION" "HOST" "PORTS" "STATUS"
     echo ""
 
     while IFS= read -r session; do
-        local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-        IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+        local s_host s_status s_pid s_project s_worktree
+        IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
-        local indicator status_str ports
+        local indicator status_str port_count
+        port_count=$(echo "$state" | jq ".spaces[\"$space\"].sessions[\"$session\"].ports // [] | length")
+
         if [[ "$s_status" == "live" ]]; then
             indicator="${GREEN}●${RESET}"
             status_str="${GREEN}live${RESET}"
-            ports="${s_lc}:${s_rc}, ${s_ls}:${s_rs}"
         else
             indicator="${DIM}○${RESET}"
             status_str="${DIM}dormant${RESET}"
-            ports="${DIM}${s_lc}:${s_rc}, ${s_ls}:${s_rs}${RESET}"
         fi
 
-        printf "  %b  %-32s ${DIM}%-18s${RESET} %-20b %b\n" "$indicator" "$session" "$s_host" "$ports" "$status_str"
+        printf "  %b  %-32s ${DIM}%-18s${RESET} %-10s %b\n" "$indicator" "$session" "$s_host" "${port_count} ports" "$status_str"
     done <<< "$sessions"
     echo ""
 }
 
 # Shared implementation for up/switch commands.
+# $5 = auto_resolve: if "true", automatically sleep conflicting sessions without prompting
 cmd_session_activate() {
     local space="$1"
     local session="${2:-}"
     local success_msg="${3:-is live}"
     local selector_label="${4:-Activate session}"
+    local auto_resolve="${5:-false}"
 
     if [[ -z "$session" ]]; then
         printf "\n  ${BOLD}%s${RESET} ${DIM}(${space})${RESET}\n" "$selector_label"
@@ -883,8 +1078,8 @@ cmd_session_activate() {
     require_space "$state" "$space"
     require_session "$state" "$space" "$session"
 
-    local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-    IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+    local s_host s_status s_pid s_project s_worktree
+    IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
     if [[ "$s_status" == "live" ]]; then
         echo ""
@@ -893,9 +1088,26 @@ cmd_session_activate() {
         return
     fi
 
-    check_and_resolve_conflicts "$s_lc" "$s_ls" "$space" "$session" || return
+    local ports_json
+    ports_json=$(read_session_ports "$state" "$space" "$session")
 
-    activate_and_report "$space" "$session" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs" "$success_msg"
+    if [[ "$auto_resolve" == "true" ]]; then
+        # Auto-sleep any conflicting session (used by switch)
+        local conflict
+        conflict=$(find_port_conflicts "$ports_json" "$space" "$session")
+        if [[ -n "$conflict" ]]; then
+            local conflict_space conflict_session
+            conflict_space=$(echo "$conflict" | cut -d: -f1)
+            conflict_session=$(echo "$conflict" | cut -d: -f2-)
+            sleep_session "$conflict_space" "$conflict_session"
+            echo ""
+            printf "  ${DIM}○${RESET} %s slept\n" "$conflict_session"
+        fi
+    else
+        check_and_resolve_conflicts "$ports_json" "$space" "$session" || return
+    fi
+
+    activate_and_report "$space" "$session" "$s_host" "$ports_json" "$success_msg"
 }
 
 cmd_session_up() {
@@ -921,8 +1133,8 @@ cmd_session_down() {
     require_space "$state" "$space"
     require_session "$state" "$space" "$session"
 
-    local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-    IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+    local s_host s_status s_pid s_project s_worktree
+    IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
     if [[ "$s_status" == "dormant" ]]; then
         echo ""
@@ -956,11 +1168,13 @@ cmd_session_rm() {
     require_space "$state" "$space"
     require_session "$state" "$space" "$session"
 
-    local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-    IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+    local s_host s_status s_pid s_project s_worktree
+    IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
     if [[ "$s_status" == "live" && "$s_pid" != "null" ]]; then
-        kill_tunnel "$s_pid" "$s_lc" "$s_ls"
+        local ports_json
+        ports_json=$(read_session_ports "$state" "$space" "$session")
+        kill_tunnel "$s_pid" "$ports_json"
     fi
 
     state=$(read_state)
@@ -972,7 +1186,7 @@ cmd_session_rm() {
 }
 
 cmd_session_switch() {
-    cmd_session_activate "$1" "${2:-}" "Switched to" "Switch session"
+    cmd_session_activate "$1" "${2:-}" "Switched to" "Switch session" "true"
 }
 
 # --- Dashboard ---
@@ -1012,19 +1226,23 @@ cmd_dashboard() {
         fi
 
         while IFS= read -r session; do
-            local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-            IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+            local s_host s_status s_pid s_project s_worktree
+            IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+            local ports_json
+            ports_json=$(read_session_ports "$state" "$space" "$session")
+            local port_count
+            port_count=$(echo "$ports_json" | jq 'length')
 
             if [[ "$s_status" == "live" ]]; then
                 local health
-                health=$(check_health "$s_pid" "$s_lc" "$s_ls")
+                health=$(check_health "$s_pid" "$ports_json")
                 if [[ "$health" == "healthy" ]]; then
-                    printf "  ${GREEN}●${RESET}  %-32s ${DIM}%s${RESET}  %s:%s, %s:%s  ${GREEN}healthy${RESET}\n" \
-                        "$session" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs"
+                    printf "  ${GREEN}●${RESET}  %-32s ${DIM}%s${RESET}  ${DIM}%d ports${RESET}  ${GREEN}healthy${RESET}\n" \
+                        "$session" "$s_host" "$port_count"
                 else
                     has_dead=true
-                    printf "  ${RED}●${RESET}  %-32s ${DIM}%s${RESET}  %s:%s, %s:%s  ${BOLD_RED}DEAD${RESET}\n" \
-                        "$session" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs"
+                    printf "  ${RED}●${RESET}  %-32s ${DIM}%s${RESET}  ${DIM}%d ports${RESET}  ${BOLD_RED}DEAD${RESET}\n" \
+                        "$session" "$s_host" "$port_count"
                 fi
             else
                 printf "  ${DIM}○${RESET}  ${DIM}%-32s %s${RESET}\n" "$session" "$s_host"
@@ -1066,15 +1284,18 @@ cmd_hydrate() {
         [[ -z "$sessions" ]] && continue
 
         while IFS= read -r session; do
-            local s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree
-            IFS=$'\t' read -r s_host s_status s_pid s_lc s_rc s_ls s_rs s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
+            local s_host s_status s_pid s_project s_worktree
+            IFS=$'\t' read -r s_host s_status s_pid s_project s_worktree <<< "$(read_session "$state" "$space" "$session")"
 
             [[ "$s_status" != "live" ]] && continue
 
             found_live=true
 
+            local ports_json
+            ports_json=$(read_session_ports "$state" "$space" "$session")
+
             local health
-            health=$(check_health "$s_pid" "$s_lc" "$s_ls")
+            health=$(check_health "$s_pid" "$ports_json")
 
             if [[ "$health" == "healthy" ]]; then
                 printf "  ${GREEN}●${RESET}  %s  ${DIM}already healthy${RESET}\n" "$session"
@@ -1082,11 +1303,15 @@ cmd_hydrate() {
             fi
 
             local port_conflict=false
-            for hp in "${hydrated_ports[@]:-}"; do
-                if [[ "$hp" == "$s_lc" || "$hp" == "$s_ls" ]]; then
-                    port_conflict=true
-                    break
-                fi
+            local session_local_ports
+            session_local_ports=$(echo "$ports_json" | jq -r '.[].local')
+            for slp in $session_local_ports; do
+                for hp in "${hydrated_ports[@]:-}"; do
+                    if [[ "$hp" == "$slp" ]]; then
+                        port_conflict=true
+                        break 2
+                    fi
+                done
             done
 
             if [[ "$port_conflict" == true ]]; then
@@ -1095,12 +1320,14 @@ cmd_hydrate() {
             fi
 
             if [[ "$s_pid" != "null" ]]; then
-                kill_tunnel "$s_pid" "$s_lc" "$s_ls"
+                kill_tunnel "$s_pid" "$ports_json"
             fi
 
             printf "  ${DIM}…${RESET}  %s  ${DIM}reconnecting${RESET}" "$session"
-            if activate_session "$space" "$session" "$s_host" "$s_lc" "$s_rc" "$s_ls" "$s_rs"; then
-                hydrated_ports+=("$s_lc" "$s_ls")
+            if activate_session "$space" "$session" "$s_host" "$ports_json"; then
+                while IFS= read -r lp; do
+                    hydrated_ports+=("$lp")
+                done < <(echo "$ports_json" | jq -r '.[].local')
                 printf "\r\033[K  ${GREEN}●${RESET}  %s  ${GREEN}reconnected${RESET}\n" "$session"
             else
                 printf "\r\033[K  ${RED}✗${RESET}  %s  ${RED}failed${RESET}\n" "$session"
